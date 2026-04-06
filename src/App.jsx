@@ -1,4 +1,4 @@
-import { useGoogleSheets } from "./hooks/useGoogleSheets";
+import { useState, useEffect, useMemo, useCallback } from "react";
 
 // ─── ICONS (inline SVG components) ───────────────────────────────────────────
 const Icons = {
@@ -53,10 +53,18 @@ const DOC_TYPES = ["Bill of Lading", "Packing List", "Commercial Invoice", "Cert
 
 const INCOTERMS = ["FOB", "CIF", "DDP", "EXW", "CFR", "DAP"];
 
+// Seeded random to avoid data changing on refresh
+function createSeededRandom(seed) {
+  let s = seed;
+  return () => {
+    s = (s * 16807 + 0) % 2147483647;
+    return s / 2147483647;
+  };
+}
+
 function generatePOs() {
+  const rng = createSeededRandom(42);
   const pos = [];
-  let seed = 42;
-  const seededRandom = () => { seed = (seed * 16807 + 0) % 2147483647; return seed / 2147483647; };
   const items = [
     { desc: "Módulos PV 580W", supplier: "Longi Green Energy", unit: "pcs", qty: 113793, unitPrice: 72.5, cat: "Modules" },
     { desc: "Inversores String 225kW", supplier: "Sungrow Power", unit: "pcs", qty: 42, unitPrice: 18500, cat: "Inverters" },
@@ -74,20 +82,20 @@ function generatePOs() {
 
   const statusKeys = Object.keys(STATUSES);
   items.forEach((item, i) => {
-    const projIdx = i < 5 ? 0 : i < 8 ? 1 : i < 9 ? 2 : i < 11 ? 3 : 3;
-    const statusIdx = Math.min(Math.floor(Math.random() * statusKeys.length), statusKeys.length - 1);
+    const projIdx = i < 5 ? 0 : i < 8 ? 1 : i < 9 ? 2 : 3;
+    const statusIdx = Math.min(Math.floor(rng() * statusKeys.length), statusKeys.length - 1);
     const status = statusKeys[statusIdx];
     const fob = item.qty * item.unitPrice;
-    const freightPct = 0.03 + Math.random() * 0.05;
-    const insPct = 0.005 + Math.random() * 0.005;
-    const dutyPct = item.cat === "Freight" ? 0 : 0.02 + Math.random() * 0.08;
+    const freightPct = 0.03 + rng() * 0.05;
+    const insPct = 0.005 + rng() * 0.005;
+    const dutyPct = item.cat === "Freight" ? 0 : 0.02 + rng() * 0.08;
     const cif = fob * (1 + freightPct + insPct);
     const ddp = cif * (1 + dutyPct);
-    const createdDate = new Date(2025, Math.floor(Math.random() * 6), 1 + Math.floor(Math.random() * 28));
-    const etd = new Date(createdDate.getTime() + (30 + Math.floor(Math.random() * 60)) * 86400000);
-    const eta = new Date(etd.getTime() + (25 + Math.floor(Math.random() * 20)) * 86400000);
-    const docsRequired = DOC_TYPES.slice(0, 4 + Math.floor(Math.random() * 3));
-    const docsReceived = docsRequired.slice(0, Math.floor(Math.random() * (docsRequired.length + 1)));
+    const createdDate = new Date(2025, Math.floor(rng() * 6), 1 + Math.floor(rng() * 28));
+    const etd = new Date(createdDate.getTime() + (30 + Math.floor(rng() * 60)) * 86400000);
+    const eta = new Date(etd.getTime() + (25 + Math.floor(rng() * 20)) * 86400000);
+    const docsRequired = DOC_TYPES.slice(0, 4 + Math.floor(rng() * 3));
+    const docsReceived = docsRequired.slice(0, Math.floor(rng() * (docsRequired.length + 1)));
 
     pos.push({
       id: `PO-${String(2025)}${String(i + 1).padStart(3, "0")}`,
@@ -99,19 +107,176 @@ function generatePOs() {
       unit: item.unit,
       unitPrice: item.unitPrice,
       currency: "USD",
-      incoterm: INCOTERMS[Math.floor(Math.random() * 3)],
+      incoterm: INCOTERMS[Math.floor(rng() * 3)],
       status,
       costs: { fob, freight: fob * freightPct, insurance: fob * insPct, cif, duties: cif * dutyPct, ddp },
-      dates: { created: createdDate, etd, eta, delivered: status === "delivered" || status === "closed" ? new Date(eta.getTime() + Math.floor(Math.random() * 7) * 86400000) : null },
+      dates: { created: createdDate, etd, eta, delivered: status === "delivered" || status === "closed" ? new Date(eta.getTime() + Math.floor(rng() * 7) * 86400000) : null },
       docs: { required: docsRequired, received: docsReceived },
       notes: "",
-      priority: Math.random() > 0.7 ? "high" : Math.random() > 0.5 ? "medium" : "low",
+      priority: rng() > 0.7 ? "high" : rng() > 0.5 ? "medium" : "low",
     });
   });
   return pos;
 }
 
 const INITIAL_POS = generatePOs();
+
+// ─── GOOGLE SHEETS HOOK ──────────────────────────────────────────────────────
+function useGoogleSheets(initialData) {
+  const [data, setData] = useState(initialData);
+  const [syncStatus, setSyncStatus] = useState("checking");
+  const [isConnected, setIsConnected] = useState(false);
+
+  useEffect(() => {
+    checkConnection();
+  }, []);
+
+  const checkConnection = async () => {
+    try {
+      const res = await fetch("/api/sheets/health");
+      if (res.ok) {
+        setIsConnected(true);
+        setSyncStatus("synced");
+        // Try to load data from sheets
+        loadFromSheets();
+      } else {
+        setIsConnected(false);
+        setSyncStatus("offline");
+      }
+    } catch {
+      setIsConnected(false);
+      setSyncStatus("offline");
+    }
+  };
+
+  const loadFromSheets = async () => {
+    try {
+      const res = await fetch("/api/sheets/read", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ range: "OC!A:Z" }),
+      });
+      if (!res.ok) return;
+      const { values } = await res.json();
+      if (!values || values.length < 2) return;
+
+      const headers = values[0];
+      const rows = values.slice(1);
+      const orders = rows.map(row => parseRow(headers, row)).filter(Boolean);
+      if (orders.length > 0) {
+        setData(orders);
+      }
+    } catch (e) {
+      console.error("Failed to load from Sheets:", e);
+    }
+  };
+
+  const parseRow = (headers, row) => {
+    try {
+      const get = (col) => {
+        const idx = headers.indexOf(col);
+        return idx >= 0 && idx < row.length ? row[idx] : "";
+      };
+      const parseDate = (val) => val ? new Date(val) : null;
+      const parseList = (val) => val ? val.split(",").map(s => s.trim()).filter(Boolean) : [];
+      const parseNum = (val) => parseFloat(val) || 0;
+
+      const projectId = get("project_id");
+      const project = PROJECTS.find(p => p.id === projectId) || {
+        id: projectId, name: get("project_name"), country: "", client: "", mwp: 0
+      };
+
+      return {
+        id: get("po_id"),
+        project,
+        description: get("description"),
+        supplier: get("supplier"),
+        category: get("category"),
+        qty: parseNum(get("qty")),
+        unit: get("unit"),
+        unitPrice: parseNum(get("unit_price")),
+        currency: get("currency") || "USD",
+        incoterm: get("incoterm") || "FOB",
+        status: get("status") || "draft",
+        priority: get("priority") || "medium",
+        costs: {
+          fob: parseNum(get("fob")),
+          freight: parseNum(get("freight")),
+          insurance: parseNum(get("insurance")),
+          cif: parseNum(get("cif")),
+          duties: parseNum(get("duties")),
+          ddp: parseNum(get("ddp")),
+        },
+        dates: {
+          created: parseDate(get("date_created")),
+          etd: parseDate(get("date_etd")),
+          eta: parseDate(get("date_eta")),
+          delivered: parseDate(get("date_delivered")),
+        },
+        docs: {
+          required: parseList(get("docs_required")),
+          received: parseList(get("docs_received")),
+        },
+        notes: get("notes"),
+      };
+    } catch {
+      return null;
+    }
+  };
+
+  const sync = useCallback(async () => {
+    setSyncStatus("syncing");
+    try {
+      await loadFromSheets();
+      setSyncStatus("synced");
+    } catch {
+      setSyncStatus("error");
+    }
+  }, []);
+
+  const writeOrder = useCallback(async (order) => {
+    if (!isConnected) return;
+    const fmtDate = (d) => d ? d.toISOString().split("T")[0] : "";
+    const fmtList = (arr) => (arr || []).join(", ");
+    const row = [
+      order.id, order.project?.id || "", order.project?.name || "",
+      order.description, order.supplier, order.category,
+      order.qty, order.unit, order.unitPrice, order.currency || "USD",
+      order.incoterm || "FOB", order.status, order.priority || "medium",
+      order.costs?.fob || 0, order.costs?.freight || 0, order.costs?.insurance || 0,
+      order.costs?.cif || 0, order.costs?.duties || 0, order.costs?.ddp || 0,
+      fmtDate(order.dates?.created), fmtDate(order.dates?.etd),
+      fmtDate(order.dates?.eta), fmtDate(order.dates?.delivered),
+      fmtList(order.docs?.required), fmtList(order.docs?.received),
+      order.notes || "",
+    ];
+    try {
+      await fetch("/api/sheets/write", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ range: "OC!A:Z", values: [row], mode: "append" }),
+      });
+    } catch (e) {
+      console.error("Write to Sheets failed:", e);
+    }
+  }, [isConnected]);
+
+  const updateStatus = useCallback(async (poId, newStatus) => {
+    setData(prev => prev.map(po => po.id === poId ? { ...po, status: newStatus } : po));
+    if (!isConnected) return;
+    try {
+      await fetch("/api/sheets/update-cell", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ poId, column: "status", value: newStatus }),
+      });
+    } catch (e) {
+      console.error("Update status failed:", e);
+    }
+  }, [isConnected]);
+
+  return { data, setData, syncStatus, isConnected, sync, writeOrder, updateStatus };
+}
 
 // ─── UTILITIES ───────────────────────────────────────────────────────────────
 const fmt = (n) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 0, maximumFractionDigits: 0 }).format(n);
@@ -144,6 +309,7 @@ const theme = {
 
 function StatusBadge({ status }) {
   const s = STATUSES[status];
+  if (!s) return <span>{status}</span>;
   return (
     <span style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "4px 12px", borderRadius: 20, fontSize: 12, fontWeight: 600, color: s.color, background: s.bg, letterSpacing: 0.3 }}>
       <span style={{ width: 6, height: 6, borderRadius: "50%", background: s.color }} />
@@ -154,7 +320,7 @@ function StatusBadge({ status }) {
 
 function PriorityDot({ priority }) {
   const colors = { high: theme.danger, medium: theme.warning, low: theme.success };
-  return <span style={{ width: 8, height: 8, borderRadius: "50%", background: colors[priority], display: "inline-block", boxShadow: `0 0 6px ${colors[priority]}44` }} title={priority} />;
+  return <span style={{ width: 8, height: 8, borderRadius: "50%", background: colors[priority] || theme.textDim, display: "inline-block", boxShadow: `0 0 6px ${(colors[priority] || theme.textDim)}44` }} title={priority} />;
 }
 
 function ProgressBar({ value, max, color = theme.accent, height = 6 }) {
@@ -260,8 +426,8 @@ const ROLES = [
 export default function App() {
   const sheets = useGoogleSheets(INITIAL_POS);
   const pos = sheets.data;
-  const setPOs = sheets.setData;
   const syncStatus = sheets.syncStatus;
+
   const [activeNav, setActiveNav] = useState("dashboard");
   const [activeRole, setActiveRole] = useState("procurement");
   const [selectedPO, setSelectedPO] = useState(null);
@@ -270,7 +436,7 @@ export default function App() {
   const [filterStatus, setFilterStatus] = useState("all");
   const [showNewPO, setShowNewPO] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  
+
   const filtered = useMemo(() => {
     return pos.filter(po => {
       if (filterProject !== "all" && po.project.id !== filterProject) return false;
@@ -283,19 +449,24 @@ export default function App() {
     });
   }, [pos, filterProject, filterStatus, searchQuery]);
 
-const handleSync = useCallback(() => {
+  const handleSync = useCallback(() => {
     sheets.sync();
   }, [sheets]);
 
   const handleStatusChange = useCallback((poId, newStatus) => {
-    setPOs(prev => prev.map(po => po.id === poId ? { ...po, status: newStatus } : po));
-  }, []);
+    sheets.updateStatus(poId, newStatus);
+  }, [sheets]);
+
+  const handleNewPO = useCallback((po) => {
+    sheets.setData(prev => [po, ...prev]);
+    sheets.writeOrder(po);
+    setShowNewPO(false);
+  }, [sheets]);
 
   return (
     <div style={{ display: "flex", height: "100vh", background: theme.bg, color: theme.text, fontFamily: "'IBM Plex Sans', 'Segoe UI', system-ui, sans-serif", fontSize: 14, overflow: "hidden" }}>
       {/* SIDEBAR */}
       <aside style={{ width: sidebarCollapsed ? 64 : 240, background: theme.bgSidebar, borderRight: `1px solid ${theme.border}`, display: "flex", flexDirection: "column", transition: "width 0.3s ease", overflow: "hidden", flexShrink: 0 }}>
-        {/* Logo */}
         <div style={{ padding: sidebarCollapsed ? "20px 12px" : "20px 22px", borderBottom: `1px solid ${theme.border}`, display: "flex", alignItems: "center", gap: 12, cursor: "pointer" }} onClick={() => setSidebarCollapsed(!sidebarCollapsed)}>
           <div style={{ width: 36, height: 36, borderRadius: 10, background: theme.gradient, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
             <Icons.Anchor style={{ width: 20, height: 20, color: "#fff" }} />
@@ -308,7 +479,6 @@ const handleSync = useCallback(() => {
           )}
         </div>
 
-        {/* Role Selector */}
         {!sidebarCollapsed && (
           <div style={{ padding: "16px 18px", borderBottom: `1px solid ${theme.border}` }}>
             <div style={{ fontSize: 10, color: theme.textDim, textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 8 }}>Vista</div>
@@ -322,7 +492,6 @@ const handleSync = useCallback(() => {
           </div>
         )}
 
-        {/* Nav */}
         <nav style={{ flex: 1, padding: "12px 10px", display: "flex", flexDirection: "column", gap: 2 }}>
           {NAV_ITEMS.map(item => {
             const active = activeNav === item.id;
@@ -336,18 +505,22 @@ const handleSync = useCallback(() => {
           })}
         </nav>
 
-        {/* Sync Status */}
         <div style={{ padding: sidebarCollapsed ? "16px 12px" : "16px 18px", borderTop: `1px solid ${theme.border}` }}>
-          <button onClick={handleSync} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: sidebarCollapsed ? "center" : "flex-start", gap: 8, padding: "8px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: syncStatus === "syncing" ? "#0e7490" + "22" : "transparent", color: syncStatus === "syncing" ? theme.accent : theme.textDim, cursor: "pointer", fontSize: 12, transition: "all 0.3s" }}>
+          <button onClick={handleSync} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: sidebarCollapsed ? "center" : "flex-start", gap: 8, padding: "8px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: syncStatus === "syncing" ? "#0e749022" : "transparent", color: syncStatus === "syncing" ? theme.accent : syncStatus === "synced" ? theme.success : syncStatus === "error" ? theme.danger : theme.textDim, cursor: "pointer", fontSize: 12, transition: "all 0.3s" }}>
             <Icons.Refresh style={{ width: 14, height: 14, animation: syncStatus === "syncing" ? "spin 1s linear infinite" : "none" }} />
-            {!sidebarCollapsed && (syncStatus === "syncing" ? "Sincronizando..." : "Google Sheets ✓")}
+            {!sidebarCollapsed && (
+              syncStatus === "syncing" ? "Sincronizando..." :
+              syncStatus === "synced" ? "Google Sheets ✓" :
+              syncStatus === "error" ? "Error de sync" :
+              syncStatus === "offline" ? "Modo offline" :
+              "Verificando..."
+            )}
           </button>
         </div>
       </aside>
 
       {/* MAIN CONTENT */}
       <main style={{ flex: 1, overflow: "auto", display: "flex", flexDirection: "column" }}>
-        {/* Top Bar */}
         <header style={{ padding: "16px 28px", borderBottom: `1px solid ${theme.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", background: theme.bgSidebar, flexShrink: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
             <h1 style={{ fontSize: 20, fontWeight: 700, margin: 0, letterSpacing: -0.3 }}>
@@ -358,12 +531,10 @@ const handleSync = useCallback(() => {
             </span>
           </div>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-            {/* Search */}
             <div style={{ position: "relative" }}>
               <Icons.Search style={{ position: "absolute", left: 10, top: "50%", transform: "translateY(-50%)", width: 14, height: 14, color: theme.textDim }} />
               <input value={searchQuery} onChange={e => setSearchQuery(e.target.value)} placeholder="Buscar PO, proveedor..." style={{ padding: "8px 12px 8px 32px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bgCard, color: theme.text, fontSize: 13, width: 220, outline: "none" }} />
             </div>
-            {/* Filters */}
             <select value={filterProject} onChange={e => setFilterProject(e.target.value)} style={{ padding: "8px 12px", borderRadius: 8, border: `1px solid ${theme.border}`, background: theme.bgCard, color: theme.text, fontSize: 12, outline: "none", cursor: "pointer" }}>
               <option value="all">Todos los proyectos</option>
               {PROJECTS.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
@@ -372,14 +543,12 @@ const handleSync = useCallback(() => {
               <option value="all">Todos los estados</option>
               {Object.entries(STATUSES).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
             </select>
-            {/* New PO */}
             <button onClick={() => setShowNewPO(true)} style={{ display: "flex", alignItems: "center", gap: 6, padding: "8px 16px", borderRadius: 8, border: "none", background: theme.accent, color: "#fff", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
               <Icons.Plus style={{ width: 14, height: 14 }} /> Nueva OC
             </button>
           </div>
         </header>
 
-        {/* Content */}
         <div style={{ flex: 1, overflow: "auto", padding: 28 }}>
           {activeNav === "dashboard" && <DashboardView pos={pos} filtered={filtered} role={activeRole} onSelectPO={setSelectedPO} onNav={setActiveNav} />}
           {activeNav === "orders" && !selectedPO && <OrdersView pos={filtered} onSelect={setSelectedPO} onStatusChange={handleStatusChange} />}
@@ -391,8 +560,7 @@ const handleSync = useCallback(() => {
         </div>
       </main>
 
-      {/* New PO Modal */}
-      {showNewPO && <NewPOModal onClose={() => setShowNewPO(false)} onSave={(po) => { setPOs(prev => [po, ...prev]); setShowNewPO(false); }} />}
+      {showNewPO && <NewPOModal onClose={() => setShowNewPO(false)} onSave={handleNewPO} />}
 
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
@@ -432,7 +600,6 @@ function DashboardView({ pos, filtered, role, onSelectPO, onNav }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, animation: "fadeIn 0.4s ease" }}>
-      {/* KPI Row */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 16 }}>
         <KPICard icon={Icons.DollarSign} label="Valor Total Procurement" value={`$${fmtK(totalValue)}`} sub="DDP all projects" color={theme.accent} trend={12} />
         <KPICard icon={Icons.Package} label="OC Activas" value={activeOrders} sub={`${pos.length} totales`} color={theme.purple} />
@@ -442,7 +609,6 @@ function DashboardView({ pos, filtered, role, onSelectPO, onNav }) {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "2fr 1fr", gap: 20 }}>
-        {/* Status Distribution */}
         <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
           <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Distribución por Estado</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -459,7 +625,6 @@ function DashboardView({ pos, filtered, role, onSelectPO, onNav }) {
           </div>
         </div>
 
-        {/* By Project Chart */}
         <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
           <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Valor por Proyecto (DDP)</h3>
           <MiniBarChart data={byProject} height={100} />
@@ -474,7 +639,6 @@ function DashboardView({ pos, filtered, role, onSelectPO, onNav }) {
         </div>
       </div>
 
-      {/* Urgent / Attention */}
       {urgent.length > 0 && (
         <div style={{ background: theme.bgCard, border: `1px solid ${theme.danger}33`, borderRadius: 14, padding: 22 }}>
           <h3 style={{ margin: "0 0 14px", fontSize: 14, fontWeight: 600, color: theme.danger, display: "flex", alignItems: "center", gap: 8 }}>
@@ -546,7 +710,6 @@ function PODetail({ po, onBack, onStatusChange }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 20, animation: "slideIn 0.3s ease" }}>
-      {/* Header */}
       <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
         <button onClick={onBack} style={{ padding: "6px 14px", borderRadius: 8, border: `1px solid ${theme.border}`, background: "transparent", color: theme.textMuted, cursor: "pointer", fontSize: 12 }}>← Volver</button>
         <h2 style={{ margin: 0, fontSize: 22, fontWeight: 700, fontFamily: "JetBrains Mono", color: theme.accent }}>{po.id}</h2>
@@ -561,7 +724,6 @@ function PODetail({ po, onBack, onStatusChange }) {
         </div>
       </div>
 
-      {/* Status Pipeline */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: "20px 22px" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 0 }}>
           {statusKeys.map((sk, i) => {
@@ -585,7 +747,6 @@ function PODetail({ po, onBack, onStatusChange }) {
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 20 }}>
-        {/* Info */}
         <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
           <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Información General</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
@@ -607,7 +768,6 @@ function PODetail({ po, onBack, onStatusChange }) {
           </div>
         </div>
 
-        {/* Dates */}
         <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
           <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Fechas Clave</h3>
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
@@ -629,7 +789,6 @@ function PODetail({ po, onBack, onStatusChange }) {
         </div>
       </div>
 
-      {/* Costs */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
         <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Desglose de Costos (FOB → CIF → DDP)</h3>
         <CostBreakdown costs={po.costs} />
@@ -647,7 +806,6 @@ function PODetail({ po, onBack, onStatusChange }) {
         </div>
       </div>
 
-      {/* Documents */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
         <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Documentos</h3>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(200px, 1fr))", gap: 10 }}>
@@ -670,12 +828,8 @@ function PODetail({ po, onBack, onStatusChange }) {
 function DocumentsView({ pos }) {
   const allDocs = pos.flatMap(po =>
     po.docs.required.map(doc => ({
-      poId: po.id,
-      project: po.project.name,
-      supplier: po.supplier,
-      docType: doc,
-      received: po.docs.received.includes(doc),
-      status: po.status,
+      poId: po.id, project: po.project.name, supplier: po.supplier,
+      docType: doc, received: po.docs.received.includes(doc), status: po.status,
     }))
   );
   const pending = allDocs.filter(d => !d.received);
@@ -683,7 +837,6 @@ function DocumentsView({ pos }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, animation: "fadeIn 0.4s ease" }}>
-      {/* Summary */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 16 }}>
         <KPICard icon={Icons.FileText} label="Total Documentos" value={allDocs.length} color={theme.accent} />
         <KPICard icon={Icons.Check} label="Recibidos" value={complete.length} sub={`${pct(complete.length, allDocs.length)}%`} color={theme.success} />
@@ -691,7 +844,6 @@ function DocumentsView({ pos }) {
         <KPICard icon={Icons.AlertTriangle} label="Críticos" value={pending.filter(d => ["shipped", "in_transit", "customs"].includes(d.status)).length} sub="embarques sin docs" color={theme.danger} />
       </div>
 
-      {/* Pending Documents */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, overflow: "hidden" }}>
         <div style={{ padding: "16px 22px", borderBottom: `1px solid ${theme.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Documentos Pendientes</h3>
@@ -708,7 +860,7 @@ function DocumentsView({ pos }) {
             </tr>
           </thead>
           <tbody>
-            {pending.slice(0, 20).map((d, i) => (
+            {pending.slice(0, 20).map((d) => (
               <tr key={`${d.poId}-${d.docType}`} style={{ borderBottom: `1px solid ${theme.border}` }}>
                 <td style={{ padding: "10px 14px", fontFamily: "JetBrains Mono", fontSize: 12, color: theme.accent }}>{d.poId}</td>
                 <td style={{ padding: "10px 14px", fontSize: 12 }}>{d.project}</td>
@@ -727,7 +879,6 @@ function DocumentsView({ pos }) {
         </table>
       </div>
 
-      {/* Doc Completion by PO */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
         <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Completitud Documental por OC</h3>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 12 }}>
@@ -765,7 +916,6 @@ function CostsView({ pos }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, animation: "fadeIn 0.4s ease" }}>
-      {/* Summary Cards */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 16 }}>
         <KPICard icon={Icons.Package} label="Total FOB" value={`$${fmtK(totalFOB)}`} color="#06b6d4" />
         <KPICard icon={Icons.Truck} label="Freight Total" value={`$${fmtK(totalFreight)}`} sub={`${pct(totalFreight, totalFOB)}% del FOB`} color="#3b82f6" />
@@ -774,7 +924,6 @@ function CostsView({ pos }) {
         <KPICard icon={Icons.DollarSign} label="Total DDP" value={`$${fmtK(totalDDP)}`} sub="costo total landed" color={theme.success} />
       </div>
 
-      {/* Cost Waterfall */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
         <h3 style={{ margin: "0 0 20px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Cascada de Costos: FOB → CIF → DDP</h3>
         <div style={{ display: "flex", alignItems: "flex-end", gap: 24, height: 200 }}>
@@ -785,21 +934,16 @@ function CostsView({ pos }) {
             { label: "= CIF", value: totalCIF, color: "#a78bfa" },
             { label: "+ Duties", value: totalDuties, color: "#f59e0b", isAdd: true },
             { label: "= DDP", value: totalDDP, color: "#10b981" },
-          ].map((b, i) => {
-            const maxVal = totalDDP;
-            const h = (b.value / maxVal) * 160;
-            return (
-              <div key={b.label} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
-                <span style={{ fontSize: 13, fontWeight: 600, fontFamily: "JetBrains Mono", color: b.color }}>${fmtK(b.value)}</span>
-                <div style={{ width: "100%", height: Math.max(h, 10), background: b.isAdd ? `${b.color}44` : b.color, borderRadius: "6px 6px 0 0", border: b.isAdd ? `2px dashed ${b.color}` : "none", transition: "height 0.5s ease" }} />
-                <span style={{ fontSize: 11, color: theme.textMuted, textAlign: "center" }}>{b.label}</span>
-              </div>
-            );
-          })}
+          ].map((b) => (
+            <div key={b.label} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, fontFamily: "JetBrains Mono", color: b.color }}>${fmtK(b.value)}</span>
+              <div style={{ width: "100%", height: Math.max((b.value / totalDDP) * 160, 10), background: b.isAdd ? `${b.color}44` : b.color, borderRadius: "6px 6px 0 0", border: b.isAdd ? `2px dashed ${b.color}` : "none", transition: "height 0.5s ease" }} />
+              <span style={{ fontSize: 11, color: theme.textMuted, textAlign: "center" }}>{b.label}</span>
+            </div>
+          ))}
         </div>
       </div>
 
-      {/* By Category Table */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, overflow: "hidden" }}>
         <div style={{ padding: "16px 22px", borderBottom: `1px solid ${theme.border}` }}>
           <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Costos por Categoría</h3>
@@ -858,9 +1002,7 @@ function TimelineView({ pos }) {
                   <div style={{ fontFamily: "JetBrains Mono", fontSize: 12, fontWeight: 600, color: theme.accent }}>{po.id}</div>
                   <div style={{ fontSize: 11, color: theme.textDim, marginTop: 2 }}>{po.supplier}</div>
                 </div>
-                <div style={{ width: 80, flexShrink: 0 }}>
-                  <StatusBadge status={po.status} />
-                </div>
+                <div style={{ width: 80, flexShrink: 0 }}><StatusBadge status={po.status} /></div>
                 <div style={{ flex: 1 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4, fontSize: 10, color: theme.textDim }}>
                     <span>ETD: {fmtDate(po.dates.etd)}</span>
@@ -868,7 +1010,6 @@ function TimelineView({ pos }) {
                   </div>
                   <div style={{ width: "100%", background: "#1e293b", borderRadius: 6, height: 10, overflow: "hidden", position: "relative" }}>
                     <div style={{ width: `${progress}%`, height: "100%", background: isLate ? theme.danger : progress > 80 ? theme.success : theme.accent, borderRadius: 6, transition: "width 0.5s ease" }} />
-                    {/* Today marker */}
                     <div style={{ position: "absolute", left: `${progress}%`, top: -2, width: 2, height: 14, background: "#fff", borderRadius: 1 }} />
                   </div>
                 </div>
@@ -884,7 +1025,6 @@ function TimelineView({ pos }) {
         </div>
       </div>
 
-      {/* Upcoming Arrivals */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
         <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Próximas Llegadas (30 días)</h3>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))", gap: 12 }}>
@@ -932,7 +1072,6 @@ function KPIsView({ pos, filtered }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 24, animation: "fadeIn 0.4s ease" }}>
-      {/* Main KPIs */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))", gap: 16 }}>
         <KPICard icon={Icons.Clock} label="Lead Time Promedio" value={`${Math.round(avgLeadTime)}d`} sub="creación → llegada" color={theme.accent} />
         <KPICard icon={Icons.Check} label="On-Time Delivery" value={`${deliveredCount > 0 ? pct(onTimeDelivery, deliveredCount) : 0}%`} sub={`${onTimeDelivery}/${deliveredCount} entregas`} color={theme.success} trend={5} />
@@ -940,7 +1079,6 @@ function KPIsView({ pos, filtered }) {
         <KPICard icon={Icons.DollarSign} label="Overhead FOB→DDP" value={`+${costOverhead}%`} sub="costos logísticos + aranceles" color={theme.purple} />
       </div>
 
-      {/* Supplier Performance */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, overflow: "hidden" }}>
         <div style={{ padding: "16px 22px", borderBottom: `1px solid ${theme.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <h3 style={{ margin: 0, fontSize: 14, fontWeight: 600 }}>Performance por Proveedor</h3>
@@ -985,7 +1123,6 @@ function KPIsView({ pos, filtered }) {
         </table>
       </div>
 
-      {/* Project Summary */}
       <div style={{ background: theme.bgCard, border: `1px solid ${theme.border}`, borderRadius: 14, padding: 22 }}>
         <h3 style={{ margin: "0 0 16px", fontSize: 14, fontWeight: 600, color: theme.textMuted }}>Resumen por Proyecto</h3>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 16 }}>
