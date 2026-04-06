@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from "react";
+import { useGoogleSheets } from "./hooks/useGoogleSheets";
 
 // ─── ICONS (inline SVG components) ───────────────────────────────────────────
 const Icons = {
@@ -55,6 +55,8 @@ const INCOTERMS = ["FOB", "CIF", "DDP", "EXW", "CFR", "DAP"];
 
 function generatePOs() {
   const pos = [];
+  let seed = 42;
+  const seededRandom = () => { seed = (seed * 16807 + 0) % 2147483647; return seed / 2147483647; };
   const items = [
     { desc: "Módulos PV 580W", supplier: "Longi Green Energy", unit: "pcs", qty: 113793, unitPrice: 72.5, cat: "Modules" },
     { desc: "Inversores String 225kW", supplier: "Sungrow Power", unit: "pcs", qty: 42, unitPrice: 18500, cat: "Inverters" },
@@ -256,7 +258,10 @@ const ROLES = [
 
 // ─── MAIN APP ────────────────────────────────────────────────────────────────
 export default function App() {
-  const [pos, setPOs] = useState(INITIAL_POS);
+  const sheets = useGoogleSheets(INITIAL_POS);
+  const pos = sheets.data;
+  const setPOs = sheets.setData;
+  const syncStatus = sheets.syncStatus;
   const [activeNav, setActiveNav] = useState("dashboard");
   const [activeRole, setActiveRole] = useState("procurement");
   const [selectedPO, setSelectedPO] = useState(null);
@@ -264,9 +269,8 @@ export default function App() {
   const [filterProject, setFilterProject] = useState("all");
   const [filterStatus, setFilterStatus] = useState("all");
   const [showNewPO, setShowNewPO] = useState(false);
-  const [syncStatus, setSyncStatus] = useState("synced");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-
+  
   const filtered = useMemo(() => {
     return pos.filter(po => {
       if (filterProject !== "all" && po.project.id !== filterProject) return false;
@@ -279,10 +283,9 @@ export default function App() {
     });
   }, [pos, filterProject, filterStatus, searchQuery]);
 
-  const handleSync = useCallback(() => {
-    setSyncStatus("syncing");
-    setTimeout(() => setSyncStatus("synced"), 2000);
-  }, []);
+const handleSync = useCallback(() => {
+    sheets.sync();
+  }, [sheets]);
 
   const handleStatusChange = useCallback((poId, newStatus) => {
     setPOs(prev => prev.map(po => po.id === poId ? { ...po, status: newStatus } : po));
